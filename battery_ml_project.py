@@ -2,14 +2,17 @@
 EV battery health & performance — ML pipeline (synthetic dataset).
 
 Tasks:
-  1) Regression: predict Degradation Rate (%) (proxy for health stress).
+  1) Regression: predict Degradation Rate (%) from electrical/thermal/context features.
   2) Binary: maintenance alert (degradation > threshold) — ROC, TPR, FPR, thresholds.
   3) Binary: replacement alert (stricter degradation threshold).
-  4) Multiclass: Optimal Charging Duration Class (0/1/2); Charging Duration excluded to avoid trivial leakage.
-  5) SoH-style readout from predicted degradation (engineering proxy, not measured capacity).
-  6) RUL proxy: regression on synthetic remaining-cycle target derived from cycles + degradation (documented).
+  4) Multiclass: Optimal Charging Duration Class (0/1/2); charging duration excluded to avoid leakage.
+  5) SoH proxy: SoH ≈ 100% − predicted degradation (coursework proxy; real SoH needs capacity tests).
+  6) RUL proxy: regression on a synthetic remaining-cycle target (methodology demo, not physical RUL).
 
-Split: 60% train / 20% validation / 20% test (stratified for classification).
+Splits (set SPLIT_MODE):
+  - "60_20_20": train / validation / test with stratified class splits.
+  - "70_30": train / test only; model choice and ROC thresholds use stratified 5-fold CV on the training set
+    (out-of-fold scores, so metrics are not inflated by reusing the same rows for fitting and thresholding).
 """
 
 from __future__ import annotations
@@ -35,7 +38,13 @@ from sklearn.metrics import (
     roc_auc_score,
     roc_curve,
 )
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import (
+    KFold,
+    StratifiedKFold,
+    cross_val_predict,
+    cross_val_score,
+    train_test_split,
+)
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier, KNeighborsRegressor
 from sklearn.pipeline import Pipeline
@@ -47,6 +56,9 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 # ---------------------------------------------------------------------------
 CSV_PATH = "ev_battery_charging_data.csv"
 RANDOM_STATE = 42
+# "60_20_20" — held-out validation set; "70_30" — train/test + 5-fold CV on train for selection / thresholds
+SPLIT_MODE = "60_20_20"
+CV_FOLDS = 5
 
 MAINT_DEG_THRESHOLD = 10.0   # % — service / inspection alert
 REPLACE_DEG_THRESHOLD = 15.0  # % — stronger replacement / major service flag
@@ -71,6 +83,18 @@ def split_train_val_test(X, y, stratify=None):
     return X_train, X_val, X_test, y_train, y_val, y_test
 
 
+def split_data(X, y, stratify=None):
+    """Return (X_train, X_val, X_test, y_train, y_val, y_test); X_val/y_val are None when SPLIT_MODE is 70_30."""
+    if SPLIT_MODE == "60_20_20":
+        return split_train_val_test(X, y, stratify=stratify)
+    if SPLIT_MODE == "70_30":
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, y, test_size=0.30, random_state=RANDOM_STATE, stratify=stratify
+        )
+        return X_train, None, X_test, y_train, None, y_test
+    raise ValueError(f"Unknown SPLIT_MODE: {SPLIT_MODE!r} (use '60_20_20' or '70_30')")
+
+
 def make_preprocessor(categorical_cols: list[str], numeric_cols: list[str]) -> ColumnTransformer:
     numeric_transformer = Pipeline(
         steps=[
@@ -81,7 +105,7 @@ def make_preprocessor(categorical_cols: list[str], numeric_cols: list[str]) -> C
     categorical_transformer = Pipeline(
         steps=[
             ("imputer", SimpleImputer(strategy="most_frequent")),
-            ("onehot", OneHotEncoder(handle_unknown="ignore")),
+            ("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
         ]
     )
     return ColumnTransformer(
@@ -93,8 +117,11 @@ def make_preprocessor(categorical_cols: list[str], numeric_cols: list[str]) -> C
 
 
 def print_split_sizes(name: str, X_train, X_val, X_test):
-    print(f"\n=== {name} ===")
-    print(f"Train: {X_train.shape}  Validation: {X_val.shape}  Test: {X_test.shape}")
+    print(f"\n=== {name} (split={SPLIT_MODE}) ===")
+    if X_val is not None:
+        print(f"Train: {X_train.shape}  Validation: {X_val.shape}  Test: {X_test.shape}")
+    else:
+        print(f"Train: {X_train.shape}  Test: {X_test.shape}  (CV on train: {CV_FOLDS} folds)")
 
 
 def roc_tpr_fpr_table(fpr, tpr, thresholds, max_rows: int = 12):
@@ -118,7 +145,7 @@ def run_binary_task(
     numeric_cols = [c for c in feature_cols if c not in categorical_cols]
     pre = make_preprocessor(categorical_cols, numeric_cols)
 
-    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y, stratify=y)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X, y, stratify=y)
     print_split_sizes(task_title, X_train, X_val, X_test)
 
     classifiers = {
@@ -129,34 +156,68 @@ def run_binary_task(
     }
 
     results = {}
+    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     for name, est in classifiers.items():
         pipe = Pipeline([("preprocess", clone(pre)), ("model", est)])
-        pipe.fit(X_train, y_train)
-        proba = pipe.predict_proba(X_val)[:, 1]
-        pred = (proba >= 0.5).astype(int)
-        results[name] = {
-            "pipe": pipe,
-            "auc": roc_auc_score(y_val, proba),
-            "acc": accuracy_score(y_val, pred),
-            "f1": f1_score(y_val, pred, zero_division=0),
-        }
+        if X_val is not None:
+            pipe.fit(X_train, y_train)
+            proba = pipe.predict_proba(X_val)[:, 1]
+            pred = (proba >= 0.5).astype(int)
+            results[name] = {
+                "est": est,
+                "auc": roc_auc_score(y_val, proba),
+                "acc": accuracy_score(y_val, pred),
+                "f1": f1_score(y_val, pred, zero_division=0),
+            }
+        else:
+            pipe_cv = Pipeline([("preprocess", clone(pre)), ("model", clone(est))])
+            aucs = cross_val_score(
+                pipe_cv, X_train, y_train, cv=skf, scoring="roc_auc", n_jobs=-1
+            )
+            results[name] = {
+                "est": est,
+                "auc": float(np.mean(aucs)),
+                "auc_std": float(np.std(aucs)),
+                "acc": float("nan"),
+                "f1": float("nan"),
+            }
 
-    print("\nValidation summary (default threshold 0.5):")
-    for name, m in sorted(results.items(), key=lambda kv: kv[1]["auc"], reverse=True):
-        print(f"  {name:22s}  AUC {m['auc']:.3f}  Acc {m['acc']:.3f}  F1 {m['f1']:.3f}")
+    print("\nModel selection summary:")
+    if X_val is not None:
+        print("(held-out validation; default threshold 0.5)")
+        for name, m in sorted(results.items(), key=lambda kv: kv[1]["auc"], reverse=True):
+            print(f"  {name:22s}  AUC {m['auc']:.3f}  Acc {m['acc']:.3f}  F1 {m['f1']:.3f}")
+    else:
+        print(f"({CV_FOLDS}-fold CV ROC-AUC on training set)")
+        for name, m in sorted(results.items(), key=lambda kv: kv[1]["auc"], reverse=True):
+            print(
+                f"  {name:22s}  AUC {m['auc']:.3f} +/- {m['auc_std']:.3f}"
+            )
 
     best_name = max(results, key=lambda k: results[k]["auc"])
-    best_pipe = results[best_name]["pipe"]
-    print(f"\nBest model (by val AUC): {best_name}")
+    best_est = classifiers[best_name]
+    print(f"\nBest model: {best_name}")
 
-    y_val_proba = best_pipe.predict_proba(X_val)[:, 1]
-    fpr, tpr, thresholds = roc_curve(y_val, y_val_proba)
-    auc_val = roc_auc_score(y_val, y_val_proba)
+    best_pipe = Pipeline([("preprocess", clone(pre)), ("model", clone(best_est))])
+    if X_val is not None:
+        best_pipe.fit(X_train, y_train)
+        y_tune_proba = best_pipe.predict_proba(X_val)[:, 1]
+        y_tune = y_val
+        tune_label = "Validation"
+    else:
+        y_tune_proba = cross_val_predict(
+            clone(best_pipe), X_train, y_train, cv=skf, method="predict_proba", n_jobs=-1
+        )[:, 1]
+        y_tune = y_train
+        tune_label = "Train (out-of-fold)"
+
+    fpr, tpr, thresholds = roc_curve(y_tune, y_tune_proba)
+    auc_tune = roc_auc_score(y_tune, y_tune_proba)
     dist = np.sqrt(fpr**2 + (1 - tpr) ** 2)
     best_idx = int(np.argmin(dist))
     best_th = thresholds[best_idx] if best_idx < len(thresholds) else 0.5
 
-    print(f"\nValidation ROC  AUC={auc_val:.4f}")
+    print(f"\n{tune_label} ROC  AUC={auc_tune:.4f}")
     print(
         f"Youden-style corner threshold ~ {best_th:.6g}  "
         f"TPR={tpr[best_idx]:.4f}  FPR={fpr[best_idx]:.4f}"
@@ -165,7 +226,7 @@ def run_binary_task(
     roc_tpr_fpr_table(fpr, tpr, thresholds)
 
     plt.figure(figsize=(6, 5))
-    plt.plot(fpr, tpr, label=f"ROC (AUC = {auc_val:.3f})")
+    plt.plot(fpr, tpr, label=f"ROC (AUC = {auc_tune:.3f})")
     plt.plot([0, 1], [0, 1], linestyle="--", color="gray")
     plt.scatter([fpr[best_idx]], [tpr[best_idx]], s=50, zorder=5, label="Chosen threshold")
     plt.xlabel("False Positive Rate")
@@ -176,13 +237,16 @@ def run_binary_task(
     plt.savefig(f"roc_{target_col}.png", dpi=150)
     plt.close()
 
-    X_trv = pd.concat([X_train, X_val], axis=0)
-    y_trv = pd.concat([y_train, y_val], axis=0)
-    best_pipe.fit(X_trv, y_trv)
+    if X_val is not None:
+        X_trv = pd.concat([X_train, X_val], axis=0)
+        y_trv = pd.concat([y_train, y_val], axis=0)
+        best_pipe.fit(X_trv, y_trv)
+    else:
+        best_pipe.fit(X_train, y_train)
 
     y_test_proba = best_pipe.predict_proba(X_test)[:, 1]
     y_pred = (y_test_proba >= best_th).astype(int)
-    print("\n--- Test set (threshold from validation corner) ---")
+    print("\n--- Test set (threshold from tuning ROC corner) ---")
     print(f"AUC:       {roc_auc_score(y_test, y_test_proba):.4f}")
     print(f"Accuracy:  {accuracy_score(y_test, y_pred):.4f}")
     print(f"Precision: {precision_score(y_test, y_pred, zero_division=0):.4f}")
@@ -194,8 +258,13 @@ def run_binary_task(
 
 
 def run_regression_degradation(df: pd.DataFrame):
-    """Predict degradation from charge/thermal/context features (exclude direct leakage)."""
-    drop_cols = ["Degradation Rate (%)", "Efficiency (%)"]
+    """Predict degradation from electrical/thermal/context features (avoid duration/class leakage)."""
+    drop_cols = [
+        "Degradation Rate (%)",
+        "Efficiency (%)",
+        "Charging Duration (min)",
+        "Optimal Charging Duration Class",
+    ]
     feature_cols = [c for c in df.columns if c not in drop_cols]
     categorical_cols = ["Charging Mode", "Battery Type", "EV Model"]
     numeric_cols = [c for c in feature_cols if c not in categorical_cols]
@@ -203,7 +272,7 @@ def run_regression_degradation(df: pd.DataFrame):
     y = df["Degradation Rate (%)"]
 
     pre = make_preprocessor(categorical_cols, numeric_cols)
-    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y, stratify=None)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X, y, stratify=None)
     print_split_sizes("Regression — Degradation Rate (%)", X_train, X_val, X_test)
 
     regressors = {
@@ -212,27 +281,45 @@ def run_regression_degradation(df: pd.DataFrame):
         "KNN Reg (k=7)": KNeighborsRegressor(n_neighbors=7),
     }
 
-    print("\nValidation metrics:")
+    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    print("\nModel selection metrics:")
     best = None
     best_name = None
-    best_pipe = None
     for name, est in regressors.items():
-        pipe = Pipeline([("preprocess", clone(pre)), ("model", est)])
-        pipe.fit(X_train, y_train)
-        p_val = pipe.predict(X_val)
-        mae = mean_absolute_error(y_val, p_val)
-        rmse = mean_squared_error(y_val, p_val) ** 0.5
-        r2 = r2_score(y_val, p_val)
-        print(f"  {name:20s}  MAE {mae:.4f}  RMSE {rmse:.4f}  R² {r2:.4f}")
+        if X_val is not None:
+            pipe = Pipeline([("preprocess", clone(pre)), ("model", est)])
+            pipe.fit(X_train, y_train)
+            p_val = pipe.predict(X_val)
+            mae = mean_absolute_error(y_val, p_val)
+            rmse = mean_squared_error(y_val, p_val) ** 0.5
+            r2 = r2_score(y_val, p_val)
+            print(f"  {name:20s}  MAE {mae:.4f}  RMSE {rmse:.4f}  R² {r2:.4f}  (validation)")
+        else:
+            pipe_cv = Pipeline([("preprocess", clone(pre)), ("model", clone(est))])
+            maes = -cross_val_score(
+                pipe_cv,
+                X_train,
+                y_train,
+                cv=kf,
+                scoring="neg_mean_absolute_error",
+                n_jobs=-1,
+            )
+            mae = float(np.mean(maes))
+            mae_std = float(np.std(maes))
+            print(f"  {name:20s}  MAE {mae:.4f} +/- {mae_std:.4f}  ({CV_FOLDS}-fold CV on train)")
         if best is None or mae < best:
             best = mae
             best_name = name
-            best_pipe = pipe
 
-    print(f"\nBest on validation MAE: {best_name}")
-    X_trv = pd.concat([X_train, X_val], axis=0)
-    y_trv = pd.concat([y_train, y_val], axis=0)
-    best_pipe.fit(X_trv, y_trv)
+    print(f"\nBest (lowest MAE): {best_name}")
+    best_est = regressors[best_name]
+    best_pipe = Pipeline([("preprocess", clone(pre)), ("model", clone(best_est))])
+    if X_val is not None:
+        X_trv = pd.concat([X_train, X_val], axis=0)
+        y_trv = pd.concat([y_train, y_val], axis=0)
+        best_pipe.fit(X_trv, y_trv)
+    else:
+        best_pipe.fit(X_train, y_train)
     p_test = best_pipe.predict(X_test)
     print("--- Test ---")
     print(f"MAE:  {mean_absolute_error(y_test, p_test):.4f}")
@@ -256,7 +343,7 @@ def run_multiclass_optimal_duration(df: pd.DataFrame):
     y = df[target].astype(int)
 
     pre = make_preprocessor(categorical_cols, numeric_cols)
-    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y, stratify=y)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X, y, stratify=y)
     print_split_sizes("Multiclass — Optimal Charging Duration Class", X_train, X_val, X_test)
 
     models = {
@@ -268,26 +355,39 @@ def run_multiclass_optimal_duration(df: pd.DataFrame):
         "KNN (k=7)": KNeighborsClassifier(n_neighbors=7),
     }
 
+    skf = StratifiedKFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
     best_f1 = -1.0
     best_name = None
-    best_pipe = None
-    print("\nValidation macro-F1:")
+    print("\nModel selection (macro-F1):")
     for name, est in models.items():
-        pipe = Pipeline([("preprocess", clone(pre)), ("model", est)])
-        pipe.fit(X_train, y_train)
-        pred = pipe.predict(X_val)
-        f1 = f1_score(y_val, pred, average="macro", zero_division=0)
-        acc = accuracy_score(y_val, pred)
-        print(f"  {name:36s}  Acc {acc:.3f}  macro-F1 {f1:.3f}")
+        if X_val is not None:
+            pipe = Pipeline([("preprocess", clone(pre)), ("model", est)])
+            pipe.fit(X_train, y_train)
+            pred = pipe.predict(X_val)
+            f1 = f1_score(y_val, pred, average="macro", zero_division=0)
+            acc = accuracy_score(y_val, pred)
+            print(f"  {name:36s}  Acc {acc:.3f}  macro-F1 {f1:.3f}  (validation)")
+        else:
+            pipe_cv = Pipeline([("preprocess", clone(pre)), ("model", clone(est))])
+            f1s = cross_val_score(
+                pipe_cv, X_train, y_train, cv=skf, scoring="f1_macro", n_jobs=-1
+            )
+            f1 = float(np.mean(f1s))
+            f1_std = float(np.std(f1s))
+            print(f"  {name:36s}  macro-F1 {f1:.3f} +/- {f1_std:.3f}  ({CV_FOLDS}-fold CV on train)")
         if f1 > best_f1:
             best_f1 = f1
             best_name = name
-            best_pipe = pipe
 
     print(f"\nBest (macro-F1): {best_name}")
-    X_trv = pd.concat([X_train, X_val], axis=0)
-    y_trv = pd.concat([y_train, y_val], axis=0)
-    best_pipe.fit(X_trv, y_trv)
+    best_est = models[best_name]
+    best_pipe = Pipeline([("preprocess", clone(pre)), ("model", clone(best_est))])
+    if X_val is not None:
+        X_trv = pd.concat([X_train, X_val], axis=0)
+        y_trv = pd.concat([y_train, y_val], axis=0)
+        best_pipe.fit(X_trv, y_trv)
+    else:
+        best_pipe.fit(X_train, y_train)
     pred_test = best_pipe.predict(X_test)
     print("--- Test ---")
     print(f"Accuracy:   {accuracy_score(y_test, pred_test):.4f}")
@@ -322,7 +422,7 @@ def run_rul_proxy_regression(df: pd.DataFrame):
 
     pre = make_preprocessor(categorical_cols, numeric_cols)
     y = pd.Series(y, index=X.index)
-    X_train, X_val, X_test, y_train, y_val, y_test = split_train_val_test(X, y, stratify=None)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(X, y, stratify=None)
     print_split_sizes("Regression — RUL proxy (synthetic cycles remaining)", X_train, X_val, X_test)
 
     pipe = Pipeline(
@@ -331,10 +431,23 @@ def run_rul_proxy_regression(df: pd.DataFrame):
             ("model", DecisionTreeRegressor(random_state=RANDOM_STATE, max_depth=10)),
         ]
     )
-    pipe.fit(X_train, y_train)
-    p_val = pipe.predict(X_val)
+    kf = KFold(n_splits=CV_FOLDS, shuffle=True, random_state=RANDOM_STATE)
+    if X_val is not None:
+        pipe.fit(X_train, y_train)
+        p_val = pipe.predict(X_val)
+        print("\nValidation  MAE:", mean_absolute_error(y_val, p_val))
+    else:
+        maes = -cross_val_score(
+            clone(pipe), X_train, y_train, cv=kf, scoring="neg_mean_absolute_error", n_jobs=-1
+        )
+        print(f"\nTrain CV MAE: {float(np.mean(maes)):.4f} +/- {float(np.std(maes)):.4f}")
+    if X_val is not None:
+        X_trv = pd.concat([X_train, X_val], axis=0)
+        y_trv = pd.concat([y_train, y_val], axis=0)
+        pipe.fit(X_trv, y_trv)
+    else:
+        pipe.fit(X_train, y_train)
     p_test = pipe.predict(X_test)
-    print("\nValidation  MAE:", mean_absolute_error(y_val, p_val))
     print("Test        MAE:", mean_absolute_error(y_test, p_test))
     print("Test        R²: ", r2_score(y_test, p_test))
 
@@ -386,6 +499,7 @@ def main():
     run_rul_proxy_regression(df)
 
     print("\nDone. ROC figures saved as roc_maintenance_needed.png and roc_replace_needed.png")
+    print(f"Split mode was {SPLIT_MODE!r}. Set SPLIT_MODE = '70_30' or '60_20_20' at top of file to switch.")
 
 
 if __name__ == "__main__":
