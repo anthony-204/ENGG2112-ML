@@ -57,7 +57,7 @@ from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
 CSV_PATH = "ev_battery_charging_data.csv"
 RANDOM_STATE = 42
 # "60_20_20" — held-out validation set; "70_30" — train/test + 5-fold CV on train for selection / thresholds
-SPLIT_MODE = "60_20_20"
+SPLIT_MODE = "70_30"
 CV_FOLDS = 5
 
 MAINT_DEG_THRESHOLD = 10.0   # % — service / inspection alert
@@ -67,9 +67,41 @@ REPLACE_DEG_THRESHOLD = 15.0  # % — stronger replacement / major service flag
 RUL_CYCLE_CAP = 1200.0
 RUL_DEG_SCALE = 12.0  # higher degradation shrinks effective remaining life in proxy
 
+# Realism controls for synthetic-data demonstrations:
+# - Slight feature noise mimics sensor uncertainty.
+# - Small label flips mimic annotation/decision noise.
+REALISM_MODE = True
+FEATURE_NOISE_FRAC = 0.03  # 3% of each numeric feature std
+BINARY_LABEL_FLIP_RATE = 0.03  # flip 3% of binary labels
+
 
 def load_data(path: str) -> pd.DataFrame:
     return pd.read_csv(path)
+
+
+def add_feature_noise(df: pd.DataFrame, exclude_cols: list[str]) -> pd.DataFrame:
+    """Inject small Gaussian noise into numeric features for realism on synthetic data."""
+    if not REALISM_MODE:
+        return df
+    out = df.copy()
+    rng = np.random.default_rng(RANDOM_STATE)
+    numeric_cols = [c for c in out.select_dtypes(include=[np.number]).columns if c not in exclude_cols]
+    for col in numeric_cols:
+        std = float(out[col].std(ddof=0))
+        if std > 0:
+            out[col] = out[col] + rng.normal(0.0, FEATURE_NOISE_FRAC * std, size=len(out))
+    return out
+
+
+def flip_binary_labels(y: pd.Series, flip_rate: float, seed_offset: int = 0) -> pd.Series:
+    """Randomly flip a small proportion of binary labels to reduce synthetic perfection."""
+    if not REALISM_MODE or flip_rate <= 0:
+        return y
+    out = y.astype(int).copy()
+    rng = np.random.default_rng(RANDOM_STATE + seed_offset)
+    mask = rng.random(len(out)) < flip_rate
+    out.loc[mask] = 1 - out.loc[mask]
+    return out
 
 
 def split_train_val_test(X, y, stratify=None):
@@ -141,7 +173,7 @@ def run_binary_task(
     task_title: str,
 ):
     X = df[feature_cols]
-    y = df[target_col].astype(int)
+    y = flip_binary_labels(df[target_col].astype(int), BINARY_LABEL_FLIP_RATE, seed_offset=17)
     numeric_cols = [c for c in feature_cols if c not in categorical_cols]
     pre = make_preprocessor(categorical_cols, numeric_cols)
 
@@ -456,6 +488,22 @@ def main():
     df = load_data(CSV_PATH)
     print("Dataset shape:", df.shape)
     print("Columns:", list(df.columns))
+    if REALISM_MODE:
+        print(
+            f"Realism mode ON: feature_noise={FEATURE_NOISE_FRAC:.1%}, "
+            f"binary_label_flip={BINARY_LABEL_FLIP_RATE:.1%}"
+        )
+    else:
+        print("Realism mode OFF: using raw synthetic data.")
+
+    df = add_feature_noise(
+        df,
+        exclude_cols=[
+            "Degradation Rate (%)",
+            "Efficiency (%)",
+            "Optimal Charging Duration Class",
+        ],
+    )
 
     # --- Derived binary targets ---
     df = df.copy()
