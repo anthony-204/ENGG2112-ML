@@ -180,7 +180,7 @@ def main() -> None:
     plt.plot([lo, hi], [lo, hi], "k--", lw=1, label="Perfect prediction")
     plt.xlabel("Actual efficiency (%)")
     plt.ylabel("Predicted efficiency (%)")
-    plt.title("Strong honest model (no degradation / duration-class inputs)")
+    plt.title("Strong model (no degradation / duration-class inputs)")
     plt.axis("square")
     plt.xlim(lo, hi)
     plt.ylim(lo, hi)
@@ -188,7 +188,7 @@ def main() -> None:
     plt.tight_layout()
     plt.savefig(OUT_PNG, dpi=150)
     plt.close()
-    print(f"\nSaved figure: {OUT_PNG}  (strong honest model: actual vs predicted)")
+    print(f"\nSaved figure: {OUT_PNG}  (strong model: actual vs predicted)")
 
 
 if __name__ == "__main__":
